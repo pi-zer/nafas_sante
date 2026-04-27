@@ -1,7 +1,6 @@
 // backend/server.js
 const express = require('express');
 const cors = require('cors');
-const os = require('os');
 const path = require('path');
 const multer = require('multer');
 const authenticateToken = require('./middleware/auth');
@@ -19,38 +18,16 @@ const { initializeDatabase, applyMigrations, pool } = require('./config/database
 
 const app = express();
 
-// ==================== IP LOCALE (DYNAMIQUE) ====================
-function getLocalIP() {
-  const interfaces = os.networkInterfaces();
-  const priority = ['Wi-Fi', 'en0', 'eth0', 'wlan0']; // préférer WiFi
+// ==================== CONFIGURATION ====================
+// 🚀 URL publique (Railway fournit RAILWAY_PUBLIC_URL, Vercel utilise VERCEL_URL)
+const BASE_URL = process.env.RAILWAY_PUBLIC_URL ||
+                 (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null) ||
+                 process.env.PUBLIC_URL ||
+                 `http://localhost:${process.env.PORT || 3000}`;
 
-  // 1. Chercher en priorité les interfaces WiFi connues
-  for (const name of priority) {
-    if (interfaces[name]) {
-      for (const iface of interfaces[name]) {
-        if (iface.family === 'IPv4' && !iface.internal) {
-          return iface.address;
-        }
-      }
-    }
-  }
+console.log(`🌐 URL publique de l'API : ${BASE_URL}`);
 
-  // 2. Fallback : première IPv4 non-interne trouvée
-  for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name]) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address;
-      }
-    }
-  }
-
-  return 'localhost';
-}
-
-// ✅ CORRECTION PRINCIPALE : appel de la fonction au lieu de l'IP hardcodée
-const LOCAL_IP = getLocalIP();
-console.log(`🌐 IP locale détectée automatiquement: ${LOCAL_IP}`);
-
+// Configuration multer pour les uploads
 const uploadStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, path.join(__dirname, 'uploads'));
@@ -76,11 +53,13 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Logging simple
-app.use((req, res, next) => {
-  console.log(`📡 ${req.method} ${req.url}`);
-  next();
-});
+// Logging simple (uniquement en développement)
+if (process.env.NODE_ENV !== 'production') {
+  app.use((req, res, next) => {
+    console.log(`📡 ${req.method} ${req.url}`);
+    next();
+  });
+}
 
 // ==================== ROUTES TEST ====================
 app.get('/', (req, res) => {
@@ -88,14 +67,14 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/ping', (req, res) => {
-  res.json({ success: true, message: 'pong', ip: LOCAL_IP });
+  res.json({ success: true, message: 'pong', url: BASE_URL });
 });
 
 app.get('/api/health', (req, res) => {
   res.json({
     success: true,
-    ip: LOCAL_IP,
-    port: PORT
+    status: 'ok',
+    port: process.env.PORT || 3000
   });
 });
 
@@ -105,7 +84,7 @@ app.put('/api/users/photo', authenticateToken, upload.single('photo'), async (re
       return res.status(400).json({ success: false, error: 'Aucun fichier reçu' });
     }
 
-    const photoUrl = `http://${LOCAL_IP}:${PORT}/uploads/${req.file.filename}`;
+    const photoUrl = `${BASE_URL}/uploads/${req.file.filename}`;
     await pool.query('UPDATE users SET photo = ?, updated_at = NOW() WHERE id = ?', [photoUrl, req.user.id]);
 
     const [users] = await pool.query(
@@ -140,6 +119,7 @@ app.get('/api/vaccinations/registry', async (req, res) => {
     const { month, region } = req.query;
     console.log(`📊 Registre vaccinations - mois: ${month}, région: ${region}`);
 
+    // À remplacer par une vraie requête SQL quand les tables seront prêtes
     const mockRegistre = [
       { id: 1, patientName: 'Jean Dupont',  vaccineName: 'BCG',   dateAdministered: '2026-04-01', region: 'Mayo-Kebbi Ouest', doseNumber: 1 },
       { id: 2, patientName: 'Marie Claire', vaccineName: 'VAT',   dateAdministered: '2026-04-05', region: 'Mayo-Kebbi Ouest', doseNumber: 2 },
@@ -171,27 +151,29 @@ app.use((err, req, res, next) => {
 // ==================== DÉMARRAGE ====================
 const PORT = process.env.PORT || 3000;
 
-const startServer = async () => {
-  try {
-    await initializeDatabase();
-    await applyMigrations();
+// Démarrage classique pour Railway / Render / développement local
+// Si on est sur Vercel, on n'écoute pas (Vercel gère l'export)
+if (!process.env.VERCEL) {
+  const startServer = async () => {
+    try {
+      await initializeDatabase();
+      await applyMigrations();
 
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`
+      app.listen(PORT, '0.0.0.0', () => {
+        console.log(`
 🚀 Serveur NafasSante lancé !
-👉 Local:   http://localhost:${PORT}
-👉 Réseau:  http://${LOCAL_IP}:${PORT}
-👉 Ping:    http://${LOCAL_IP}:${PORT}/api/ping
-👉 Registre: http://${LOCAL_IP}:${PORT}/api/vaccinations/registry?month=2026-04&region=all
+👉 URL publique : ${BASE_URL}
+👉 Port interne : ${PORT}
+👉 Endpoint santé : ${BASE_URL}/api/health
+        `);
+      });
+    } catch (err) {
+      console.error('❌ Impossible de démarrer le serveur:', err.message || err);
+      process.exit(1);
+    }
+  };
+  startServer();
+}
 
-📱 Dans ton app React Native, utilise :
-   API_URL = "http://${LOCAL_IP}:${PORT}/api"
-      `);
-    });
-  } catch (err) {
-    console.error('❌ Impossible de démarrer le serveur:', err.message || err);
-    process.exit(1);
-  }
-};
-
-startServer();
+// ==================== EXPORT POUR VERCEL ====================
+module.exports = app;
