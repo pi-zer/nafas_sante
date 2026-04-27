@@ -2,10 +2,13 @@
 const fs = require('fs');
 const path = require('path');
 const mysql = require('mysql2/promise');
-require('dotenv').config();
+
+// ✅ Fix Vercel : dotenv uniquement en local, pas en production
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
 
 // ⚠️ Pour Railway : on utilise UNIQUEMENT les variables d'environnement fournies
-// Ne pas mettre de valeurs par défaut (localhost, root…) qui cassent le déploiement
 const DB_HOST     = process.env.MYSQL_HOST     || process.env.DB_HOST;
 const DB_USER     = process.env.MYSQL_USER     || process.env.DB_USER;
 const DB_PASSWORD = process.env.MYSQL_PASSWORD || process.env.DB_PASSWORD;
@@ -32,9 +35,7 @@ const poolConfig = {
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
   dateStrings: true,
-  enablePrepare: false,
-  // Désactiver la vérification SSL pour les connexions internes Railway
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined
+  ssl: { rejectUnauthorized: false }
 };
 
 const pool = mysql.createPool(poolConfig);
@@ -75,6 +76,7 @@ const initializeDatabase = async () => {
       password: DB_PASSWORD,
       port: DB_PORT,
       multipleStatements: true,
+      ssl: { rejectUnauthorized: false }
     });
     try {
       await executeSqlStatements(connection, initSql);
