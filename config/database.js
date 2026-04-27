@@ -3,44 +3,53 @@ const fs = require('fs');
 const path = require('path');
 const mysql = require('mysql2/promise');
 
-// ✅ Fix Vercel : dotenv uniquement en local, pas en production
+// Charger dotenv uniquement en développement
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-// ⚠️ Pour Railway : on utilise UNIQUEMENT les variables d'environnement fournies
-const DB_HOST     = process.env.MYSQL_HOST     || process.env.DB_HOST;
-const DB_USER     = process.env.MYSQL_USER     || process.env.DB_USER;
-const DB_PASSWORD = process.env.MYSQL_PASSWORD || process.env.DB_PASSWORD;
-const DB_NAME     = process.env.MYSQL_DATABASE || process.env.DB_NAME;
-const DB_PORT     = process.env.MYSQL_PORT     || process.env.DB_PORT || 3306;
+// Utiliser les variables d'environnement compatibles avec Aiven (ou Render)
+const DB_HOST     = process.env.DB_HOST || process.env.MYSQL_HOST;
+const DB_USER     = process.env.DB_USER || process.env.MYSQL_USER;
+const DB_PASSWORD = process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD;
+const DB_NAME     = process.env.DB_NAME || process.env.MYSQL_DATABASE || 'defaultdb';
+const DB_PORT     = parseInt(process.env.DB_PORT || process.env.MYSQL_PORT || '3306', 10);
+const DB_SSL_CA   = process.env.DB_SSL_CA; // chemin optionnel vers le certificat CA
 
-// Vérification : si les variables obligatoires sont absentes, on bloque le démarrage
-if (!DB_HOST || !DB_USER || !DB_NAME) {
-  console.error('❌ Erreur de configuration : variables de connexion MySQL manquantes.');
-  console.error('   Vérifiez que MYSQL_HOST, MYSQL_USER et MYSQL_DATABASE sont définies.');
+// Vérifier les variables essentielles
+if (!DB_HOST || !DB_USER) {
+  console.error('❌ Erreur : variables DB_HOST et DB_USER doivent être définies.');
   process.exit(1);
 }
 
-// Options de connexion
+// Construction des options de pool
 const poolConfig = {
   host: DB_HOST,
   user: DB_USER,
   password: DB_PASSWORD,
   database: DB_NAME,
-  port: parseInt(DB_PORT, 10),
+  port: DB_PORT,
   waitForConnections: true,
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT) || 10,
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT, 10) || 10,
   queueLimit: 0,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
   dateStrings: true,
-  ssl: { rejectUnauthorized: false }
 };
+
+// Gestion SSL (obligatoire pour Aiven)
+if (DB_SSL_CA && fs.existsSync(DB_SSL_CA)) {
+  poolConfig.ssl = { ca: fs.readFileSync(DB_SSL_CA) };
+  console.log('🔒 SSL avec certificat CA');
+} else if (DB_HOST !== 'localhost' && DB_HOST !== '127.0.0.1') {
+  // Pour Aiven, on active SSL même sans certificat local (mais moins sécurisé)
+  poolConfig.ssl = { rejectUnauthorized: false };
+  console.warn('⚠️ SSL activé sans vérification du certificat');
+}
 
 const pool = mysql.createPool(poolConfig);
 
-// Lecture du script d'initialisation (si besoin)
+// Lecture du script init.sql
 const readInitSql = () => {
   const initPath = path.join(__dirname, '..', 'database', 'init.sql');
   return fs.readFileSync(initPath, 'utf8');
@@ -49,18 +58,18 @@ const readInitSql = () => {
 const executeSqlStatements = async (connection, sql) => {
   const statements = sql
     .split(/;\s*$/gm)
-    .map((stmt) => stmt.trim())
+    .map(stmt => stmt.trim())
     .filter(Boolean);
-  for (const statement of statements) {
-    await connection.query(statement);
+  for (const stmt of statements) {
+    await connection.query(stmt);
   }
 };
 
-// Initialisation de la base (création si absente)
+// Initialisation (création de la base si elle n'existe pas)
 const initializeDatabase = async () => {
   try {
-    const testConn = await pool.getConnection();
-    testConn.release();
+    const conn = await pool.getConnection();
+    conn.release();
     console.log('✅ Base de données MySQL déjà accessible');
     return;
   } catch (err) {
@@ -68,33 +77,33 @@ const initializeDatabase = async () => {
       console.error('❌ Erreur de connexion MySQL:', err.message);
       throw err;
     }
-    console.log('⚠️ Base de données manquante : initialisation en cours...');
+    console.log('⚠️ Base manquante, initialisation...');
     const initSql = readInitSql();
-    const connection = await mysql.createConnection({
+    const tempConn = await mysql.createConnection({
       host: DB_HOST,
       user: DB_USER,
       password: DB_PASSWORD,
       port: DB_PORT,
       multipleStatements: true,
-      ssl: { rejectUnauthorized: false }
+      ssl: poolConfig.ssl || undefined,
     });
     try {
-      await executeSqlStatements(connection, initSql);
-      console.log('✅ Base de données initialisée avec succès');
+      await executeSqlStatements(tempConn, initSql);
+      console.log('✅ Base initialisée avec succès');
     } finally {
-      await connection.end();
+      await tempConn.end();
     }
   }
 };
 
 const testConnection = async () => {
   try {
-    const connection = await pool.getConnection();
-    console.log('✅ Connecté à la base de données MySQL');
-    connection.release();
+    const conn = await pool.getConnection();
+    console.log('✅ Connecté à MySQL');
+    conn.release();
     return true;
   } catch (err) {
-    console.error('❌ Erreur de connexion MySQL:', err.message);
+    console.error('❌ Erreur MySQL:', err.message);
     return false;
   }
 };
@@ -105,52 +114,42 @@ const applyMigrations = async () => {
     if (!fs.existsSync(migrationsDir)) {
       fs.mkdirSync(migrationsDir, { recursive: true });
     }
-    const migrationFiles = fs.readdirSync(migrationsDir)
-      .filter(file => file.endsWith('.sql'))
+    const files = fs.readdirSync(migrationsDir)
+      .filter(f => f.endsWith('.sql'))
       .sort();
-    if (migrationFiles.length === 0) {
-      console.log('ℹ️ Aucune migration à appliquer');
+    if (files.length === 0) {
+      console.log('ℹ️ Aucune migration');
       return;
     }
-    const connection = await pool.getConnection();
-    await connection.query(`
+    const conn = await pool.getConnection();
+    await conn.query(`
       CREATE TABLE IF NOT EXISTS migrations (
         id INT PRIMARY KEY AUTO_INCREMENT,
         name VARCHAR(255) UNIQUE NOT NULL,
         applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    for (const file of migrationFiles) {
-      const [rows] = await connection.query(
-        'SELECT * FROM migrations WHERE name = ?',
-        [file]
-      );
-      if (rows.length > 0) {
+    for (const file of files) {
+      const [rows] = await conn.query('SELECT * FROM migrations WHERE name = ?', [file]);
+      if (rows.length) {
         console.log(`⏭️ Migration déjà appliquée: ${file}`);
         continue;
       }
-      console.log(`📝 Application de la migration: ${file}`);
-      const migrationSql = fs.readFileSync(
-        path.join(migrationsDir, file),
-        'utf8'
-      );
-      const statements = migrationSql
+      console.log(`📝 Application: ${file}`);
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      const statements = sql
         .split(/;\s*$/gm)
-        .map((stmt) => stmt.trim())
-        .filter(stmt => stmt && !stmt.startsWith('--'));
-      for (const statement of statements) {
-        await connection.query(statement);
+        .map(s => s.trim())
+        .filter(s => s && !s.startsWith('--'));
+      for (const stmt of statements) {
+        await conn.query(stmt);
       }
-      await connection.query(
-        'INSERT INTO migrations (name) VALUES (?)',
-        [file]
-      );
-      console.log(`✅ Migration appliquée: ${file}`);
+      await conn.query('INSERT INTO migrations (name) VALUES (?)', [file]);
+      console.log(`✅ Migration ${file} appliquée`);
     }
-    connection.release();
-  } catch (error) {
-    console.error('❌ Erreur lors de l\'application des migrations:', error.message);
-    console.warn('⚠️ Continuant malgré l\'erreur de migration...');
+    conn.release();
+  } catch (err) {
+    console.error('❌ Erreur migrations:', err.message);
   }
 };
 
